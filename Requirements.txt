@@ -1,0 +1,5 @@
+pymupdf
+anthropic
+instructor
+pydantic
+python-dotenv

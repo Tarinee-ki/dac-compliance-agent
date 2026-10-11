@@ -3,7 +3,7 @@ import re
 import sys
 import unicodedata
 from typing import Literal
- 
+
 try:
     import pymupdf as fitz          # newer PyMuPDF
 except ImportError:
@@ -12,9 +12,9 @@ import instructor
 from anthropic import Anthropic
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field
- 
+
 load_dotenv()
- 
+
 PDF_PATH = "crcf_regulation.pdf"
 DOC_ID = "CRCF"
 ARTICLES = [4, 5, 6, 7]
@@ -22,8 +22,8 @@ ARTICLES = [4, 5, 6, 7]
 # about tool_choice, that is the reason (use an Instructor mode without forced tool choice).
 EXTRACT_MODEL = "claude-haiku-5-5"
 AUDIT_MODEL = "claude-haiku-5-5"
- 
- 
+
+
 # ----------------------------------------------------------------------------- schemas
 class ExtractedRule(BaseModel):
     compliance_category: str = Field(description="Short topic label, e.g. Quantification, Additionality, Storage, Liability, Sustainability")
@@ -34,42 +34,59 @@ class ExtractedRule(BaseModel):
     verbatim_quote: str = Field(description=(
         "Text copied EXACTLY from the paragraph, character for character. If the requirement is a sub-point "
         "(a), (b)..., write the lead-in sentence, then ' [...] ', then the sub-point. Never paraphrase."))
- 
- 
+
+
 class ExtractedRules(BaseModel):
     rules: list[ExtractedRule]
- 
- 
+
+
 class AuditResult(BaseModel):
     is_valid: bool = Field(description="True only if the rule is fully supported by the source paragraph and quote.")
     reasoning: str = Field(description="One sentence explaining the decision.")
- 
- 
+
+
 # ----------------------------------------------------------------------------- text helpers
 _TRANSLATE = str.maketrans({"‘": "'", "’": "'", "“": '"', "”": '"',
-                            "–": "-", "—": "-", "−": "-", " ": " ", "​": ""})
- 
- 
+                            "–": "-", "—": "-", "−": "-", " ": " ", "​": ""})
+
+
 def normalize(text: str) -> str:
     text = unicodedata.normalize("NFKC", text).translate(_TRANSLATE)
     return re.sub(r"\s+", " ", text).strip()
- 
- 
+
+
 def quote_in_source(quote: str, source: str) -> bool:
     """Every part of the quote (parts are separated by [...]) must appear in the source paragraph."""
     parts = [p for p in re.split(r"\[\.\.\.\]|\[…\]", quote) if normalize(p)]
     src = normalize(source)
     return bool(parts) and all(normalize(p) in src for p in parts)
- 
- 
+
+
+RISKY_WORDS = ["must", "only", "always", "never", "exclusively"]
+MODAL_FOR_TYPE = {"shall": r"\bshall\b", "shall_not": r"\bshall not\b", "should": r"\bshould\b", "may": r"\bmay\b"}
+
+
+def code_flags(rule_text, obligation_type, quote, source):
+    """Cheap, exact checks that do not need an AI. Returns a list of reasons (empty = nothing found)."""
+    flags = []
+    rule_l, src_l = normalize(rule_text).lower(), normalize(source).lower()
+    for w in RISKY_WORDS:
+        if re.search(rf"\b{w}\b", rule_l) and not re.search(rf"\b{w}\b", src_l):
+            flags.append(f"the rule uses '{w}' but the source paragraph does not")
+    pattern = MODAL_FOR_TYPE.get(obligation_type)
+    if pattern and not re.search(pattern, normalize(quote).lower()):
+        flags.append(f"obligation_type is '{obligation_type}' but the quote contains no such modal verb")
+    return flags
+
+
 # ----------------------------------------------------------------------------- PDF -> paragraphs
 _FURNITURE = [re.compile(r"^EN$"), re.compile(r"^OJ L, \d{1,2}\.\d{1,2}\.\d{4}$"),
               re.compile(r"^\d+/\d+$"), re.compile(r"^ELI: https?://\S+$")]
 _ARTICLE = re.compile(r"^Article (\d+)$")
 _PARA = re.compile(r"^(\d{1,2})\.(?:\s+(\S.*))?$")                 # "1." alone on a line, or "1.  text"
 _SUBPOINT = re.compile(r"^\((?:[a-z]{1,2}|[ivx]{1,5}|\d{1,2})\)(?:\s|$)")
- 
- 
+
+
 def read_lines(pdf_path):
     """[(line, pdf_page)] without the page headers/footers that cut through sentences."""
     out = []
@@ -80,8 +97,8 @@ def read_lines(pdf_path):
                 if line and not any(p.match(line) for p in _FURNITURE):
                     out.append((line, i))
     return out
- 
- 
+
+
 def join_lines(lines):
     parts = []
     for ln in lines:
@@ -92,8 +109,8 @@ def join_lines(lines):
         else:
             parts.append(ln)
     return "".join(parts).strip()
- 
- 
+
+
 def parse_paragraphs(pdf_path, articles):
     lines = read_lines(pdf_path)
     start = next(i for i, (t, _) in enumerate(lines) if t == "CHAPTER 1")
@@ -129,49 +146,53 @@ def parse_paragraphs(pdf_path, articles):
                                "text": join_lines([t for t, _ in plines]),
                                "pages": str(p0) if p0 == p1 else f"{p0}-{p1}"})
     return chunks
- 
- 
+
+
 # ----------------------------------------------------------------------------- AI steps
 def extract(client, chunk):
     prompt = f"""You are reading ONE paragraph of an official EU regulation: Article {chunk['article']}({chunk['paragraph']}) "{chunk['title']}".
- 
+
 List every distinct requirement in it: obligations (shall), prohibitions (shall not), recommendations (should) and permissions (may).
- 
+
 Rules:
-- One requirement per entry. Do not merge two requirements into one entry.
+- Only extract text that contains shall / shall not / should / may. Definitions, descriptions and formulas ("X is the amount of ...") are NOT requirements. Skip them.
+- ONE sentence = ONE rule when its parts all qualify the same obligation. Conditions, exceptions and limits such as "only", "unless", "where feasible", "where appropriate" or "and in accordance with ..." must stay INSIDE the rule they limit. Never split such a sentence into several partial rules.
+- Create separate rules only for separate obligations: different 'shall' statements, different subjects, or separate sub-points (a), (b), (c).
+- extracted_rule: plain English, using 'shall' (or 'shall not', 'should', 'may') exactly as in the text. Never use 'must'. Do not add words such as 'only', 'always' or 'never' that are not in the text, and do not drop them if the text has them.
 - verbatim_quote must be copied exactly from the paragraph, never paraphrased. For a sub-point (a), (b)..., start the quote with the lead-in sentence, then ' [...] ', then the sub-point, so the quote shows who must do what.
-- extracted_rule uses only what the quote says. Never add words like 'only' or 'must'.
-- Ignore definitions, formulas without an obligation, and background text.
 - If the paragraph contains no requirement, return an empty list.
- 
+
 <paragraph>
 {chunk['text']}
 </paragraph>"""
     return client.messages.create(model=EXTRACT_MODEL, max_tokens=4096,
                                   messages=[{"role": "user", "content": prompt}],
                                   response_model=ExtractedRules, max_retries=2)
- 
- 
+
+
 def audit(client, chunk, rule):
-    prompt = f"""You are a strict, independent auditor. Check whether an extracted rule is fully supported by the source text.
- 
-Reject (is_valid = false) if the rule adds, drops or changes meaning compared with the source, for example:
-'only', 'must' or extra conditions that the text does not contain, 'may' turned into 'shall' (or the reverse),
-a wrong subject or scope. Also reject if the quote does not state the requirement.
-When in doubt, reject.
- 
+    prompt = f"""You are a strict, independent auditor. Check whether an extracted rule is supported by the source text.
+
+Reject (is_valid = false) if ANY of these is true:
+1. The rule changes the meaning: wrong subject or scope, 'may' and 'shall' swapped, or another modal verb such as 'must' instead of 'shall'.
+2. The rule drops a condition, exception or limit that restricts the SAME obligation it states (for example 'only', 'unless otherwise stated', 'where feasible', 'where appropriate'), or adds one that the text does not contain.
+3. The rule states a requirement that the quote does not contain (for example it turns a definition into an obligation).
+
+Do NOT reject only because the source paragraph also contains other, separate obligations that this rule does not mention. A rule that states one complete obligation correctly is valid.
+If points 1-3 are doubtful, reject. If the only issue is that the rule is narrower than the paragraph, accept.
+
 <source_paragraph reference="Article {chunk['article']}({chunk['paragraph']})">
 {chunk['text']}
 </source_paragraph>
- 
+
 Extracted rule: {rule.extracted_rule}
 Obligation type: {rule.obligation_type}
 Quote: {rule.verbatim_quote}"""
     return client.messages.create(model=AUDIT_MODEL, max_tokens=500,
                                   messages=[{"role": "user", "content": prompt}],
                                   response_model=AuditResult, max_retries=2)
- 
- 
+
+
 def process(client, chunks):
     accepted, rejected = [], []
     for chunk in chunks:
@@ -194,6 +215,12 @@ def process(client, chunks):
                 rejected.append(row)
                 print(f"   [!] {row['rule_id']}: quote not found in source, rejected")
                 continue
+            flags = code_flags(rule.extracted_rule, rule.obligation_type, rule.verbatim_quote, chunk["text"])
+            if flags:                                                       # free check, no auditor call spent
+                row.update(status="needs_review", audit_reasoning="Code check: " + "; ".join(flags))
+                rejected.append(row)
+                print(f"   [!] {row['rule_id']} needs review: {'; '.join(flags)}")
+                continue
             try:
                 verdict = audit(client, chunk, rule)
             except Exception as e:
@@ -209,19 +236,19 @@ def process(client, chunks):
                 rejected.append(row)
                 print(f"   [!] {row['rule_id']} rejected by auditor: {verdict.reasoning}")
     return accepted, rejected
- 
- 
+
+
 FIELDS = ["rule_id", "article", "paragraph", "page_number", "compliance_category", "obligation_type",
           "extracted_rule", "verbatim_quote", "status", "audit_reasoning"]
- 
- 
+
+
 def write_csv(path, rows):
     with open(path, "w", newline="", encoding="utf-8-sig") as f:       # utf-8-sig: Excel shows dashes correctly
         w = csv.DictWriter(f, fieldnames=FIELDS, extrasaction="ignore")
         w.writeheader()
         w.writerows(rows)
- 
- 
+
+
 def main(client=None, pdf_path=PDF_PATH, limit=None):
     import os
     if not os.path.exists(pdf_path):
@@ -235,12 +262,11 @@ def main(client=None, pdf_path=PDF_PATH, limit=None):
     client = client or instructor.from_anthropic(Anthropic())
     accepted, rejected = process(client, chunks)
     write_csv("compliance_register.csv", accepted)
-    write_csv("rejected_rules.csv", rejected)
+    write_csv("rules_for_review.csv", rejected)
     print(f"\n{len(accepted)} rules passed the checks -> compliance_register.csv")
-    print(f"{len(rejected)} rules rejected or failed -> rejected_rules.csv (read the reasons!)")
+    print(f"{len(rejected)} rules need review, were rejected, or failed -> rules_for_review.csv (read the status and reason!)")
     print("These are machine-checked, NOT expert-approved. A human must review before use.")
- 
- 
+
+
 if __name__ == "__main__":
     main(limit=int(sys.argv[1]) if len(sys.argv) > 1 else None)
- 
